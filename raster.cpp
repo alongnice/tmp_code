@@ -45,9 +45,12 @@ namespace {
         SYSTEM_STATE_LIMITED  // 安全触发激活，机器人已暂停
     };
 
-    // System State Variable (atomic for thread-safe reads outside the main logic lock)
     // 状态变量 (原子变量，用于在主逻辑锁之外安全读取)
     std::atomic<SystemState> current_system_state{SYSTEM_STATE_NORMAL};
+
+    // 系统状态转换通知标志 (原子变量，用于线程安全)
+    std::atomic<bool> limited_state_message_sent_this_cycle{false};
+    std::atomic<bool> normal_state_message_sent_this_cycle{false};
 
     // 机器人状态 - 受控机器人各自的信息
     struct RobotState {
@@ -597,6 +600,8 @@ static void io_monitor_thread() {
 
             // 步骤 3: 如果需要，执行状态转换动作
             SystemState previous_state = current_system_state.load(std::memory_order_acquire); // 原子读取
+
+            // 如果检测到状态变化
             if (previous_state != required_state) {
                 if(file_logger) {
                     std::string log_msg = "检测到系统状态变化: ";
@@ -606,28 +611,60 @@ static void io_monitor_thread() {
                     SPDLOG_INFO(log_msg);
                 }
 
-                current_system_state.store(required_state, std::memory_order_release); // 原子更新
+                // 先更新全局状态，以便其他地方读取到最新状态
+                current_system_state.store(required_state, std::memory_order_release);
 
+                // 根据需要转换到的新状态执行对应动作
                 if (required_state == SYSTEM_STATE_LIMITED) {
-                    // 转换为 LIMITED
+                    // 转换为 LIMITED 的动作和通知
+                    // 发送系统级别的安全触发通知 (首次进入此状态周期时)
+                    if (!limited_state_message_sent_this_cycle.load()) {
+                        std::string msg = "光栅安全：检测到安全区域侵犯，系统进入安全受限状态！";
+                        NRC_TriggerErrorReport(1, msg); // 使用警告级别 1
+                        if(file_logger) SPDLOG_WARN(msg);
+                        limited_state_message_sent_this_cycle.store(true); // 标记已发送
+                        normal_state_message_sent_this_cycle.store(false); // 重置另一状态的标志
+
+                        // 重置所有机器人的恢复消息标志
+                        for(int id : handled_robot_ids) {
+                           getRobotState(id).message_sent_recovered = false;
+                        }
+                    }
+                    // 执行暂停动作
                     pause_robots(); // 动作: 暂停机器人 (在锁定区域内)
-                } else { // 转换为 NORMAL (required_state 是 NORMAL)
-                    // 注意: 恢复只有在所有 `already_triggered` 标志都为 false 时才会发生，
-                    // 这也是 required_state 变为 NORMAL 的原因.
+
+                } else { // required_state == SYSTEM_STATE_NORMAL
+                    // 转换为 NORMAL 的动作和通知
+                    // 发送系统级别的安全解除通知 (首次进入此状态周期时)
+                    if (!normal_state_message_sent_this_cycle.load()) {
+                         std::string msg = "光栅安全：安全条件解除，系统恢复正常状态。";
+                         NRC_TriggerErrorReport(0, msg); // 使用信息级别 0
+                         if(file_logger) SPDLOG_INFO(msg);
+                         normal_state_message_sent_this_cycle.store(true); // 标记已发送
+                         limited_state_message_sent_this_cycle.store(false); // 重置另一状态的标志
+
+                         // 重置所有机器人的暂停消息标志
+                         for(int id : handled_robot_ids) {
+                            getRobotState(id).message_sent_limited = false;
+                         }
+                    }
+                    // 执行恢复动作
                     resume_robots(); // 动作: 恢复机器人 (在锁定区域内)
                 }
             } else {
-                 // 如果需要调试，可以周期性记录当前状态，但要避免刷屏
+                 // 如果状态没有变化，检查是否需要发送持续状态消息 (例如，持续受限报警)
+                 // 目前策略是在状态转换时发送一次，这里可以省略或添加周期性消息
+                 // 例如：如果状态一直是 LIMITED 且未发送过持续报警，则发送
+                 // if (required_state == SYSTEM_STATE_LIMITED && !...持续报警标志...) { ... }
                  // if(file_logger) SPDLOG_DEBUG("系统状态保持: {}", current_system_state.load() == SYSTEM_STATE_NORMAL ? "正常" : "安全受限");
             }
 
-            // Step 4: Periodically update robot state in map (optional, could also do on demand in actions)
-            // Periodically updating ensures robot_states.current_run_status is reasonably fresh.
-             for(int id : handled_robot_ids) {
-                 getRobotState(id).current_run_status = NRC_Rbt_GetProgramRunStatus(id);
-             }
+            // Step 4: Periodically update robot state in map
+            for(int id : handled_robot_ids) {
+                getRobotState(id).current_run_status = NRC_Rbt_GetProgramRunStatus(id);
+            }
 
-        } // --- 锁范围结束 ---
+        }  // --- 锁范围结束 ---
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50)); // 监测频率
     }

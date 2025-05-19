@@ -112,13 +112,13 @@ static RobotState& getRobotState(int robot_id) {
         // 假设 NRC 调用在 io_mutex 持有期间是安全的.
         robot_states[robot_id].current_run_status = NRC_Rbt_GetProgramRunStatus(robot_id);
         // NRC_GetCurrentOpenJob 可能在无作业打开/运行/暂停时失败.
-        std::string initial_job_name;
-        int get_job_ret = NRC_GetCurrentOpenJob(robot_id, initial_job_name);
-        if(get_job_ret == 0 && (robot_states[robot_id].current_run_status == 1 || robot_states[robot_id].current_run_status == 2)) {
+        // std::string initial_job_name;
+        // int get_job_ret = NRC_GetCurrentOpenJob(robot_id, initial_job_name);
+        // if(get_job_ret == 0 && (robot_states[robot_id].current_run_status == 1 || robot_states[robot_id].current_run_status == 2)) {
              // If already running or paused AND we successfully got a job name, maybe store it?
              // However, we only need the job name if *we* paused it. Storing it here might be misleading.
              // Let's stick to only storing job name when *we* pause.
-        }
+        // }
 
         if(file_logger) SPDLOG_INFO("已初始化机器人 {} 的状态结构体.", robot_id);
     }
@@ -317,15 +317,17 @@ static bool setFilePermissions(const std::string& path) {
 // 保存当前配置 (io_list_indexed 和 configured_limited_speed) 到文件
 // 假定调用者已持有 io_mutex.
 static bool save_to_file() {
+    std::string filename = CONFIG_DIR + "/" + CONFIG_FILE_NAME;
+    json j;
+
     try {
         if (!createDirectory(CONFIG_DIR)) {
-            return false; // createDirectory 已记录错误
+            // 错误已在 createDirectory 中记录
+            return false;
         }
 
-        std::string filename = CONFIG_DIR + "/" + CONFIG_FILE_NAME;
-        if(file_logger) SPDLOG_INFO("保存配置到文件: {}", filename);
+        if(file_logger) SPDLOG_INFO("准备保存配置到文件: {}", filename);
 
-        json j;
         j["last_update"] = std::time(nullptr);
         j["io_config"] = json::array();
 
@@ -351,17 +353,39 @@ static bool save_to_file() {
             return false;
         }
 
-        file << j.dump(4); // 漂亮打印，缩进 4 个空格
-        file.close();
-
-        if (!setFilePermissions(filename)) {
-            // setFilePermissions 已记录错误
+        // 写入文件内容，这部分可能抛出异常
+        try {
+            file << j.dump(4); // 漂亮打印，缩进 4 个空格
+        } catch (const std::exception& e) {
+            std::cerr << "[光栅安全控制] 写入配置文件内容时发生异常: " + std::string(e.what()) << std::endl;
+            if(file_logger) SPDLOG_ERROR("写入配置文件内容时发生异常: {}", e.what());
+            file.close(); // 确保文件关闭
+            return false;
         }
 
+        file.close();
+
+        // 检查文件关闭是否成功 (虽然 file.close() 通常不抛异常，但检查可以发现其他问题)
+        if (file.fail()) {
+             std::cerr << "[光栅安全控制] 写入配置文件后关闭文件失败: " + filename << std::endl;
+             if(file_logger) SPDLOG_ERROR("写入配置文件后关闭文件失败: {}", filename);
+             return false;
+        }
+
+
+        if (!setFilePermissions(filename)) {
+            // 错误已在 setFilePermissions 中记录
+            // 文件已保存，但权限设置失败，仍视为保存不完全成功
+            return false;
+        }
+
+        if(file_logger) SPDLOG_INFO("配置文件保存成功: {}", filename);
         return true;
+
     } catch (const std::exception& e) {
-        std::cerr << "[光栅安全控制] 保存配置文件失败: " + std::string(e.what()) << std::endl;
-        if(file_logger) SPDLOG_ERROR("保存配置文件失败: {}", e.what());
+        // 捕获其他任何未预期到的异常
+        std::cerr << "[光栅安全控制] 保存配置文件过程中发生未知异常: " + std::string(e.what()) << std::endl;
+        if(file_logger) SPDLOG_ERROR("保存配置文件过程中发生未知异常: {}", e.what());
         return false;
     }
 }
@@ -370,116 +394,126 @@ static bool save_to_file() {
 // 假定调用者已持有 io_mutex.
 static bool load_from_file() {
     std::string filename = CONFIG_DIR + "/" + CONFIG_FILE_NAME;
-
-    if (!fileExists(filename)) {
-        // 如果目录不存在则创建
-        if (!createDirectory(CONFIG_DIR)) {
-            // createDirectory 已记录错误
-             if(file_logger) SPDLOG_ERROR("加载配置失败: 创建目录失败.");
-            return false; // 没有目录无法继续
-        }
-
-        // 如果找不到配置文件，则创建一个默认文件
-        if(file_logger) SPDLOG_INFO("找不到配置文件，创建默认文件: {}", filename);
-        json j;
-        j["last_update"] = std::time(nullptr);
-        j["io_config"] = json::array(); // 空配置
-        j["limited_speed"] = configured_limited_speed; // 默认速度 30
-
-        std::ofstream file(filename.c_str());
-        if (!file) {
-            std::cerr << "[光栅安全控制] 无法创建新配置文件: " + filename << std::endl;
-            if(file_logger) SPDLOG_ERROR("无法创建新配置文件: {}", filename);
-            return false;
-        }
-        file << j.dump(4);
-        file.close();
-
-        if (!setFilePermissions(filename)) {
-            // setFilePermissions 已记录错误
-        }
-        // 默认配置现在隐式加载 (io_list_indexed 已默认初始化)
-        if(file_logger) SPDLOG_INFO("默认配置文件已创建，默认设置已生效.");
-        return true;
-    }
-
-    std::ifstream file(filename.c_str());
-    if (!file) {
-        std::cerr << "[光栅安全控制] 无法打开配置文件: " + filename << std::endl;
-        if(file_logger) SPDLOG_ERROR("无法打开配置文件: {}", filename);
-        return false;
-    }
-
+    std::ifstream file;
     json j;
-    bool json_load_ok = true;
+
     try {
-        file >> j;
-    } catch(const std::exception& e) {
-        std::cerr << "[光栅安全控制] 配置文件解析失败: " + std::string(e.what()) << std::endl;
-        if(file_logger) SPDLOG_ERROR("配置文件解析失败: {}", e.what());
-        file.close();
-        return false;
-    }
-    file.close();
+        if (!fileExists(filename)) {
+            // 创建目录如果不存在
+            if (!createDirectory(CONFIG_DIR)) {
+                // 错误已在 createDirectory 中记录
+                if(file_logger) SPDLOG_ERROR("加载配置失败: 创建目录失败.");
+                return false; // 没有目录无法继续
+            }
 
-    if(file_logger) SPDLOG_INFO("成功读取配置文件: {}", filename);
-
-    // 将 io_list_indexed 重置为默认状态 (所有未配置)
-    io_list_indexed.assign(2049, IOConfig()); // 使用默认构造函数: io_index=-1, is_configured=false
-
-    if (j.contains("io_config") && j["io_config"].is_array()) {
-        const auto& io_config = j["io_config"];
-        for (const auto& item : io_config) {
-            if (item.is_object() && item.contains("io_index") && item["io_index"].is_number_integer()) {
-                int io_index = item["io_index"].get<int>();
-
-                if (io_index >= 0 && io_index < io_list_indexed.size()) {
-                    // 使用加载的数据创建 IOConfig 对象
-                    IOConfig cfg;
-                    cfg.io_index = io_index;
-                    cfg.reset_io_index = item.value("reset_io_index", 0);
-                    cfg.trigger_value = item.value("trigger_value", 1); // 默认触发高电平
-                    cfg.description = item.value("description", "");
-                    cfg.already_triggered = false; // 加载时总是未触发
-                    cfg.trigger_time = 0;
-                    cfg.is_configured = true; // 标记为已配置
-
-                    // 验证 reset_io_index 范围
-                    if (cfg.reset_io_index < 0 || cfg.reset_io_index > 2048) {
-                         if(file_logger) SPDLOG_WARN("配置文件中IO {} 的复位IO索引 {} 无效，将复位IO索引设为 0.", cfg.io_index, cfg.reset_io_index);
-                         cfg.reset_io_index = 0; // 修正无效的复位索引
-                    }
-
-                    io_list_indexed[io_index] = cfg; // 存储到索引列表
-                    if(file_logger) {
-                         std::string debug_msg = "加载 IO 配置: 索引" + std::to_string(cfg.io_index) +
-                                                 ", 复位=" + std::to_string(cfg.reset_io_index) +
-                                                 ", 触发值=" + std::to_string(cfg.trigger_value) +
-                                                 ", 描述='" + cfg.description + "'";
-                         SPDLOG_DEBUG(debug_msg);
-                    }
-                } else {
-                    if(file_logger) SPDLOG_WARN("配置文件中无效的 IO 索引 {}，跳过此条目.", io_index);
-                }
+            // 如果找不到配置文件，则创建一个默认文件
+            if(file_logger) SPDLOG_INFO("配置文件未找到: {}，将尝试创建默认配置.", filename);
+            // 创建默认配置并保存
+            bool created_default = save_to_file(); // save_to_file 会在此处创建默认内容并保存
+            if (created_default) {
+                if(file_logger) SPDLOG_INFO("默认配置文件已创建.");
+                // Default config is implicitly loaded by io_list_indexed default constructor and configured_limited_speed init value
+                return true; // 默认配置已创建并加载
             } else {
-                 if(file_logger) SPDLOG_WARN("io_config 数组中无效的条目: 不是对象或缺少/无效 'io_index'");
+                std::cerr << "[光栅安全控制] 无法创建默认配置文件: " + filename << std::endl;
+                if(file_logger) SPDLOG_ERROR("无法创建默认配置文件: {}", filename);
+                return false; // 无法创建默认文件
             }
         }
-    } else {
-         if(file_logger) SPDLOG_WARN("配置文件不包含有效的 'io_config' 数组.");
+
+        // 文件存在，尝试打开
+        file.open(filename.c_str());
+        if (!file) {
+            std::cerr << "[光栅安全控制] 无法打开配置文件进行读取: " + filename << std::endl;
+            if(file_logger) SPDLOG_ERROR("无法打开配置文件进行读取: {}", filename);
+            return false;
+        }
+
+        // 解析文件内容，这部分可能抛出异常
+        try {
+            file >> j; // 使用 nlohmann/json 从流解析
+        } catch(const std::exception& e) {
+            std::cerr << "[光栅安全控制] 配置文件解析失败: " + std::string(e.what()) << std::endl;
+            if(file_logger) SPDLOG_ERROR("配置文件解析失败: {}", e.what());
+            file.close(); // 确保文件关闭
+            return false;
+        }
+
+        file.close();
+
+        // 将 io_list_indexed 重置为默认状态 (所有未配置)
+        io_list_indexed.assign(2049, IOConfig()); // 使用默认构造函数: io_index=-1, is_configured=false
+        if(file_logger) SPDLOG_DEBUG("内存中配置已重置为默认状态.");
+
+        if (j.contains("io_config") && j["io_config"].is_array()) {
+            const auto& io_config = j["io_config"];
+            if(file_logger) SPDLOG_DEBUG("配置文件包含 'io_config' 数组，开始加载 IO 配置...");
+            for (const auto& item : io_config) {
+                if (item.is_object() && item.contains("io_index") && item["io_index"].is_number_integer()) {
+                    int io_index = item["io_index"].get<int>();
+
+                    if (io_index >= 0 && io_index <= 2048) { // 验证索引范围
+                        // 使用加载的数据创建 IOConfig 对象
+                        IOConfig cfg;
+                        cfg.io_index = io_index;
+                        cfg.reset_io_index = item.value("reset_io_index", 0);
+                        cfg.trigger_value = item.value("trigger_value", 1); // 默认触发高电平 (1)
+                        cfg.description = item.value("description", "");
+                        cfg.already_triggered = false; // 加载时总是未触发
+                        cfg.trigger_time = 0;
+                        cfg.is_configured = true; // 标记为已配置
+
+                        // 验证 reset_io_index 范围
+                        if (cfg.reset_io_index < 0 || cfg.reset_io_index > 2048) {
+                             if(file_logger) SPDLOG_WARN("配置文件中IO {} 的复位IO索引 {} 无效，将复位IO索引设为 0.", cfg.io_index, cfg.reset_io_index);
+                             cfg.reset_io_index = 0; // 修正无效的复位索引
+                        }
+                         // 验证 trigger_value 范围 (虽然上面value()有默认值，但再次检查)
+                        if (cfg.trigger_value != 0 && cfg.trigger_value != 1) {
+                            if(file_logger) SPDLOG_WARN("配置文件中IO {} 的触发值 {} 无效，应为 0 或 1. 将设为默认值 1.", cfg.io_index, cfg.trigger_value);
+                            cfg.trigger_value = 1; // 修正无效触发值
+                        }
+
+
+                        io_list_indexed[io_index] = cfg; // 存储到索引列表
+                        if(file_logger) {
+                             std::string debug_msg = "加载 IO 配置: 索引" + std::to_string(cfg.io_index) +
+                                                     ", 复位=" + std::to_string(cfg.reset_io_index) +
+                                                     ", 触发值=" + std::to_string(cfg.trigger_value) +
+                                                     ", 描述='" + cfg.description + "'";
+                             SPDLOG_DEBUG(debug_msg);
+                        }
+                    } else {
+                        if(file_logger) SPDLOG_WARN("配置文件中无效的 IO 索引 {}，跳过此条目. IO索引应在 0-2048 范围内.", io_index);
+                    }
+                } else {
+                     if(file_logger) SPDLOG_WARN("io_config 数组中无效的条目: 不是对象或缺少/无效 'io_index'. 跳过.");
+                }
+            }
+        } else {
+             if(file_logger) SPDLOG_WARN("配置文件不包含有效的 'io_config' 数组或数组为空.");
+        }
+
+        // 加载 configured_limited_speed
+        configured_limited_speed = j.value("limited_speed", configured_limited_speed);
+        // 验证 configured_limited_speed 范围
+        if (configured_limited_speed < 0 || configured_limited_speed > 100) {
+             if(file_logger) SPDLOG_WARN("从文件加载的 configured_limited_speed {} 无效，应在 0-100 范围内. 使用默认值 {}.", configured_limited_speed, 30);
+             configured_limited_speed = 30; // 如果加载的值无效，重置为有效的默认值
+        }
+        // 注意: 从配置中加载的 'limited_speed' 值被存储，但实际动作总是暂停 (速度 0)
+
+
+        if(file_logger) SPDLOG_INFO("成功从文件加载配置. 已加载 IO 配置 {} 条, 配置的限速: {}%", io_list_indexed.size(), configured_limited_speed);
+        return true;
+
+    } catch (const std::exception& e) {
+        // 捕获其他任何未预期到的异常
+        std::cerr << "[光栅安全控制] 加载配置文件过程中发生未知异常: " + std::string(e.what()) << std::endl;
+        if(file_logger) SPDLOG_ERROR("加载配置文件过程中发生未知异常: {}", e.what());
+        if (file.is_open()) file.close(); // 确保文件关闭
+        return false;
     }
-
-    // 加载 configured_limited_speed
-    configured_limited_speed = j.value("limited_speed", configured_limited_speed);
-    // 注意: 从配置中加载的 'limited_speed' 值被存储，但实际动作总是暂停 (速度 0)
-    if (configured_limited_speed < 0 || configured_limited_speed > 100) {
-         if(file_logger) SPDLOG_WARN("从文件加载的 configured_limited_speed {} 无效，使用默认值 {}.", configured_limited_speed, 30);
-         configured_limited_speed = 30; // 如果加载的值无效，重置为有效的默认值
-    }
-
-
-    if(file_logger) SPDLOG_INFO("成功从文件加载配置. 配置的限速: {}%", configured_limited_speed);
-    return true;
 }
 
 // 主状态机循环
@@ -510,6 +544,7 @@ static void io_monitor_thread() {
 
                 if (!io.is_configured) continue; // 跳过未配置的条目
 
+                // IO索引已经验证过在0-2048范围内，可以安全调用read_io
                 bool current_io_value = read_io(io.io_index); // 假定 read_io 在此足够线程安全
 
                 // 如果此 IO 的触发条件当前满足
@@ -534,7 +569,7 @@ static void io_monitor_thread() {
                     if (io.already_triggered) {
                         bool meets_reset_condition = false;
                         if (io.reset_io_index > 0) {
-                            // 已配置复位 IO，检查其状态
+                            // 已配置复位 IO，检查其状态 (索引已经验证过在0-2048范围内)
                             bool reset_io_value = read_io(io.reset_io_index); // 假定 read_io 安全
                             meets_reset_condition = reset_io_value == true; // 假定复位 IO 触发高电平 (True)
                              if(file_logger) {
@@ -602,8 +637,8 @@ static void io_monitor_thread() {
                  // if(file_logger) SPDLOG_DEBUG("系统状态保持: {}", current_system_state.load() == SYSTEM_STATE_NORMAL ? "正常" : "安全受限");
             }
 
-            // 步骤 4: 周期性更新 map 中的机器人状态 (可选，也可在动作中按需进行)
-            // 周期性更新确保 robot_states.current_run_status 相对新鲜.
+            // Step 4: Periodically update robot state in map (optional, could also do on demand in actions)
+            // Periodically updating ensures robot_states.current_run_status is reasonably fresh.
              for(int id : handled_robot_ids) {
                  getRobotState(id).current_run_status = NRC_Rbt_GetProgramRunStatus(id);
              }
@@ -620,75 +655,77 @@ static void io_monitor_thread() {
 // --- 对外接口实现 ---
 
 bool updateIOConfig(const std::vector<IOConfig>& config, int limited_speed) {
+    // 整个函数不再被一个大的 try-catch 包围
     std::lock_guard<std::mutex> lock(io_mutex); // 保护 io_list_indexed 和 configured_limited_speed
-    try {
-        if (limited_speed < 0 || limited_speed > 100) {
-            if(file_logger) SPDLOG_WARN("更新时提供的限速值无效: {}", limited_speed);
-            return false;
-        }
 
-        configured_limited_speed = limited_speed; // 存储配置的值
-
-        // 清除索引列表中的现有配置
-        io_list_indexed.assign(2049, IOConfig()); // 重置所有为未配置 (-1 io_index, is_configured=false)
-        if(file_logger) SPDLOG_INFO("已清除内存中的现有 IO 配置.");
-
-
-        // 应用输入向量中的新配置
-        for (const auto& cfg_in : config) {
-            // 检查 IO 索引有效性
-            if (cfg_in.io_index >= 0 && cfg_in.io_index <= 2048) {
-                // 确保复位 IO 索引也有效或为 0
-                if (cfg_in.reset_io_index >= 0 && cfg_in.reset_io_index <= 2048) {
-                     // 根据输入创建新的 IOConfig 对象，但状态重置
-                     IOConfig cfg_new;
-                     cfg_new.io_index = cfg_in.io_index;
-                     cfg_new.reset_io_index = cfg_in.reset_io_index;
-                     cfg_new.trigger_value = cfg_in.trigger_value; // 存储 0 或 1
-                     cfg_new.description = cfg_in.description;
-                     cfg_new.is_configured = true; // 标记为已配置
-                     cfg_new.already_triggered = false; // 更新时总是重置
-                     cfg_new.trigger_time = 0;
-
-                     io_list_indexed[cfg_new.io_index] = cfg_new; // 存储到索引列表
-                     if(file_logger) {
-                         std::string debug_msg = "已应用 IO " + std::to_string(cfg_new.io_index) + " 的新配置: 复位=" + std::to_string(cfg_new.reset_io_index) +
-                                                 ", 触发值=" + std::to_string(cfg_new.trigger_value) + ", 描述='" + cfg_new.description + "'";
-                         SPDLOG_DEBUG(debug_msg);
-                     }
-
-
-                } else {
-                    if(file_logger) SPDLOG_WARN("更新配置中 IO {} 的复位 IO 索引 {} 无效，跳过此配置条目.", cfg_in.io_index, cfg_in.reset_io_index);
-                }
-            } else {
-                 if(file_logger) SPDLOG_WARN("更新配置向量中无效的 IO 索引 {}，跳过条目.", cfg_in.io_index);
-            }
-        }
-
-        // 保存到文件
-        bool saved = save_to_file(); // save_to_file 内部获取 mutex，此处没问题
-
-        // 监测线程将在下一循环检测到所有 already_triggered 标志已清除，
-        // 并在需要时 (即如果当前系统状态为 LIMITED 且物理 IO 安全) 触发恢复.
-
-        if (saved) {
-            if(file_logger) {
-                std::string log_msg = "IO 配置已成功更新到内存和文件. 配置的限速: " + std::to_string(limited_speed) + "%";
-                SPDLOG_INFO(log_msg);
-            }
-        } else {
-             if(file_logger) {
-                 std::string error_msg = "IO 配置已更新到内存，但保存到文件失败: " + CONFIG_DIR + "/" + CONFIG_FILE_NAME + ". 配置在内存中已激活.";
-                 SPDLOG_ERROR(error_msg);
-             }
-        }
-        return saved; // 返回保存状态
-    } catch (const std::exception& e) {
-        std::cerr << "[光栅安全控制] 更新 IO 配置出错: " + std::string(e.what()) << std::endl;
-        if(file_logger) SPDLOG_ERROR("更新 IO 配置出错: {}", e.what());
+    if (limited_speed < 0 || limited_speed > 100) {
+        if(file_logger) SPDLOG_WARN("更新时提供的限速值无效: {}", limited_speed);
         return false;
     }
+
+    configured_limited_speed = limited_speed; // 存储配置的值
+
+    // 清除索引列表中的现有配置
+    io_list_indexed.assign(2049, IOConfig()); // 重置所有为未配置 (-1 io_index, is_configured=false)
+    if(file_logger) SPDLOG_INFO("已清除内存中的现有 IO 配置.");
+
+
+    // 应用输入向量中的新配置
+    for (const auto& cfg_in : config) {
+        // 检查 IO 索引有效性
+        if (cfg_in.io_index >= 0 && cfg_in.io_index <= 2048) {
+            // 确保复位 IO 索引也有效或为 0
+            if (cfg_in.reset_io_index >= 0 && cfg_in.reset_io_index <= 2048) {
+                 // 创建新的 IOConfig 对象基于输入，但状态重置
+                 IOConfig cfg_new;
+                 cfg_new.io_index = cfg_in.io_index;
+                 cfg_new.reset_io_index = cfg_in.reset_io_index;
+                 cfg_new.trigger_value = cfg_in.trigger_value; // 存储 0 或 1
+                 cfg_new.description = cfg_in.description;
+                 cfg_new.is_configured = true; // 标记为已配置
+                 cfg_new.already_triggered = false; // 更新时总是重置
+                 cfg_new.trigger_time = 0;
+
+                 // 验证 trigger_value 范围
+                 if (cfg_new.trigger_value != 0 && cfg_new.trigger_value != 1) {
+                      if(file_logger) SPDLOG_WARN("更新配置中 IO {} 的触发值 {} 无效，应为 0 或 1. 将设为默认值 1.", cfg_new.io_index, cfg_new.trigger_value);
+                      cfg_new.trigger_value = 1; // 修正无效的触发值
+                 }
+
+
+                 io_list_indexed[cfg_new.io_index] = cfg_new; // 存储到索引列表
+                 if(file_logger) {
+                     std::string debug_msg = "已应用 IO " + std::to_string(cfg_new.io_index) + " 的新配置: 复位=" + std::to_string(cfg_new.reset_io_index) +
+                                             ", 触发值=" + std::to_string(cfg_new.trigger_value) + ", 描述='" + cfg_new.description + "'";
+                     SPDLOG_DEBUG(debug_msg);
+                 }
+
+            } else {
+                if(file_logger) SPDLOG_WARN("更新配置中 IO {} 的复位 IO 索引 {} 无效，应在 0-2048 范围内. 跳过此配置条目.", cfg_in.io_index, cfg_in.reset_io_index);
+            }
+        } else {
+             if(file_logger) SPDLOG_WARN("更新配置向量中无效的 IO 索引 {}，应在 0-2048 范围内. 跳过条目.", cfg_in.io_index);
+        }
+    }
+
+    // 保存到文件
+    bool saved = save_to_file(); // save_to_file 内部获取 mutex，此处没问题
+
+    // 监测线程将在下一循环检测到所有 already_triggered 标志已清除，
+    // 并在需要时 (即如果当前系统状态为 LIMITED 且物理 IO 安全) 触发恢复.
+
+    if (saved) {
+        if(file_logger) {
+            std::string log_msg = "IO 配置已成功更新到内存和文件. 配置的限速: " + std::to_string(limited_speed) + "%";
+            SPDLOG_INFO(log_msg);
+        }
+    } else {
+         if(file_logger) {
+             std::string error_msg = "IO 配置已更新到内存，但保存到文件失败: " + CONFIG_DIR + "/" + CONFIG_FILE_NAME + ". 配置在内存中已激活.";
+             SPDLOG_ERROR(error_msg);
+         }
+    }
+    return saved; // 返回保存状态
     // 返回时释放 Mutex
 }
 
@@ -730,6 +767,7 @@ bool resetSpeed() {
 
     for (const auto& io : io_list_indexed) {
         if (io.is_configured) {
+            // IO索引已经验证过在0-2048范围内，可以安全调用read_io
             bool current_value = read_io(io.io_index);
             bool meets_trigger_condition = (current_value == (io.trigger_value == 1));
             if (meets_trigger_condition) {
@@ -882,7 +920,8 @@ void rasterSafetyService() {
 
     // 日志目录和日志系统初始化
     bool log_init_success = true;
-    if (!createDirectory(CONFIG_DIR)) { // createDirectory 自身会记录错误
+    // createDirectory 自身会记录错误
+    if (!createDirectory(CONFIG_DIR)) {
         std::cerr << "[光栅安全控制] 初始化日志目录失败，可能无法写入日志文件." << std::endl;
         log_init_success = false;
     }
@@ -924,7 +963,8 @@ void rasterSafetyService() {
     // 首次加载在此处发生. 后续更新通过 updateIOConfig.
     {
         std::lock_guard<std::mutex> lock(io_mutex); // 保护配置加载
-        if (!load_from_file()) { // load_from_file 自身会记录错误
+        // load_from_file 自身会记录错误
+        if (!load_from_file()) {
             std::cerr << "[光栅安全控制] 启动时配置文件读写存在问题." << std::endl;
             // 继续使用 io_list_indexed 的默认构造函数加载的默认/空配置
         } else {
@@ -1029,12 +1069,32 @@ static void handle_shutdown_signal(int signal_num) {
 
 // --- 请求处理函数 (来自 NRC Socket 回调) ---
 void rasterSafetyControl(const Json::Value &root) {
-    if (!root.isMember("reqRasterSafetyControl")) {
-        // 不是我们的请求类型或格式错误
+    // 检查最外层结构
+    if (!root.isMember("reqRasterSafetyControl") || !root["reqRasterSafetyControl"].isObject()) {
+        if(file_logger) {
+            std::string warn_msg = "收到无效的 Socket 请求格式: 缺少 'reqRasterSafetyControl' 对象.";
+            // 尝试打印接收到的原始内容，以便调试
+            Json::FastWriter writer;
+            warn_msg += " 接收到的原始数据开始部分: ";
+            warn_msg += writer.write(root).substr(0, 200); // 只打印前200字符
+            SPDLOG_WARN(warn_msg);
+        } else {
+             // Fallback to stderr
+             std::cerr << "[光栅安全控制] 收到无效的 Socket 请求格式: 缺少 'reqRasterSafetyControl' 对象." << std::endl;
+        }
+
+        // 可以选择发送一个通用错误响应，或者保持静默取决于协议约定
+        Json::Value response;
+        response["reqRasterSafetyControlCB"] = Json::Value(Json::objectValue);
+        response["reqRasterSafetyControlCB"]["status"] = false;
+        response["reqRasterSafetyControlCB"]["message"] = "无效请求格式";
+        // NRC_SendSocketCustomProtocal(0x927b, Json::FastWriter().write(response)); // 如果协议约定需要回复的话
         return;
     }
+
     const Json::Value& request = root["reqRasterSafetyControl"];
 
+    // 检查 operation 字段
     if (!request.isMember("operation") || !request["operation"].isString()) {
         std::cerr << "[光栅安全控制] 无效的请求格式: 缺少或operation字段无效" << std::endl;
         if(file_logger) SPDLOG_ERROR("无效的请求格式: 缺少或operation字段无效");
@@ -1055,6 +1115,7 @@ void rasterSafetyControl(const Json::Value &root) {
     if(file_logger) SPDLOG_INFO("收到光栅安全控制请求操作: {}", operation);
 
     if (operation == "update_config") {
+        // 检查必要参数及其类型
         if (!request.isMember("limited_speed") || !request["limited_speed"].isInt() ||
             !request.isMember("config_data") || !request["config_data"].isArray())
         {
@@ -1067,6 +1128,7 @@ void rasterSafetyControl(const Json::Value &root) {
 
             std::vector<IOConfig> new_config_vec;
             // 从 Json::Value 解析到 vector<IOConfig> 并验证
+            if(file_logger) SPDLOG_DEBUG("开始解析 config_data 数组，共 {} 个条目.", config_data_json.size());
             for (const auto& item : config_data_json) {
                  if (!item.isObject()) {
                       if(file_logger) SPDLOG_WARN("更新配置: config_data 数组中无效条目 (不是对象). 跳过.");
@@ -1084,60 +1146,64 @@ void rasterSafetyControl(const Json::Value &root) {
 
                  // 验证基本范围
                  if (io_index < 0 || io_index > 2048) {
-                     if(file_logger) SPDLOG_WARN("更新配置: 配置条目中无效的 io_index {}. 跳过.", io_index);
-                     continue; // 跳过无效 io_index
+                     if(file_logger) SPDLOG_WARN("更新配置: 配置条目中无效的 io_index {}. IO索引应在 0-2048 范围内. 跳过.", io_index);
+                     continue; // Skip invalid io_index
                  }
                  if (reset_io_index < 0 || reset_io_index > 2048) {
-                      if(file_logger) SPDLOG_WARN("更新配置: IO {} 的复位 io_index {} 无效. 为此条目将 reset_io_index 设为 0.", io_index, reset_io_index);
-                      reset_io_index = 0; // 修正无效的复位索引
+                      if(file_logger) SPDLOG_WARN("更新配置: IO {} 的复位 io_index {} 无效，应在 0-2048 范围内. 为此条目将 reset_io_index 设为 0.", io_index, reset_io_index);
+                      reset_io_index = 0; // Correct invalid reset index
                  }
                  if (trigger_value_int != 0 && trigger_value_int != 1) {
-                      if(file_logger) SPDLOG_WARN("更新配置: IO {} 的 trigger_value {} 无效. 使用默认值 1.", io_index, trigger_value_int);
-                      trigger_value_int = 1; // 修正无效的触发值
+                      if(file_logger) SPDLOG_WARN("更新配置: IO {} 的 trigger_value {} 无效. 应为 0 或 1. 使用默认值 1.", io_index, trigger_value_int);
+                      trigger_value_int = 1; // Correct invalid trigger value
                  }
 
-
-                 // 创建 IOConfig 并添加到向量
-                 // IOConfig 构造函数接受 int，但内部使用 bool 进行 trigger_value 比较
+                 // Create IOConfig and add to vector
+                 // IOConfig constructor takes int, but internally we use bool for trigger_value comparison
                  IOConfig config(io_index, reset_io_index, trigger_value_int, description);
                  new_config_vec.push_back(config);
+                 if(file_logger) SPDLOG_DEBUG("已从请求中成功解析并添加 IO {} 到待更新列表.", io_index);
             }
+            if(file_logger) SPDLOG_DEBUG("config_data 数组解析完成. 有效条目数: {}.", new_config_vec.size());
 
-            // 调用内部更新函数，传入验证后的向量
+            // Call the internal update function with the validated vector
             bool success = updateIOConfig(new_config_vec, limited_speed);
             response["reqRasterSafetyControlCB"]["status"] = success;
             response["reqRasterSafetyControlCB"]["message"] = success ? "配置已更新" : "配置更新失败 (请查看日志)";
         }
 
-    } else if (operation == "reset_speed") { // 这意味着 "重置触发并尝试恢复"
-        // 此操作在请求 JSON 中不需要额外参数
-        bool success = resetSpeed(); // 调用重构后的复位函数
+    } else if (operation == "reset_speed") { // This means "reset triggers and attempt recovery"
+        // This operation does not require extra parameters in the request JSON
+        bool success = resetSpeed(); // Call the refactored reset function
         response["reqRasterSafetyControlCB"]["status"] = success;
         response["reqRasterSafetyControlCB"]["message"] = success ? "触发已重置，已尝试恢复" : "触发已重置，但安全条件仍然激活. 恢复失败.";
-        response["reqRasterSafetyControlCB"]["limited_speed"] = getCurrentLimitedSpeed(); // 返回配置的限速值
-        // 注意: 如果仍然受限，实际速度是 0；如果成功，则恢复到正常运行速度.
+        response["reqRasterSafetyControlCB"]["limited_speed"] = getCurrentLimitedSpeed(); // Return the configured speed value
+        // Note: the actual speed is 0 if still limited, or back to normal run speed if successful.
 
     } else if (operation == "get_config") {
-        // 此操作在请求 JSON 中不需要额外参数
-        response["reqRasterSafetyControlCB"]["status"] = true; // 除非获取数据出错，否则假定成功
+        // This operation does not require extra parameters in the request JSON
+        response["reqRasterSafetyControlCB"]["status"] = true; // Assume success initially unless errors occur fetching data
 
-        response["reqRasterSafetyControlCB"]["limited_speed"] = getCurrentLimitedSpeed(); // 获取配置的限速值
+        response["reqRasterSafetyControlCB"]["limited_speed"] = getCurrentLimitedSpeed(); // Get the configured speed value
 
         Json::Value config_data_array(Json::arrayValue);
-        std::vector<IOState> triggered_states = getTriggeredIOStates(); // 获取当前已触发的状态 (获取内部锁)
+        std::vector<IOState> triggered_states = getTriggeredIOStates(); // Get currently triggered states (acquires internal lock)
 
-        // 访问 io_list_indexed 获取所有已配置的 IO (需要锁)
+        // Access io_list_indexed to get all configured IOs (requires lock)
         std::lock_guard<std::mutex> lock(io_mutex);
+        if(file_logger) SPDLOG_DEBUG("准备构建 get_config 响应的 config_data 数组...");
+        int configured_io_count = 0;
         for (int i = 0; i < io_list_indexed.size(); ++i) {
             const auto& io = io_list_indexed[i];
             if (io.is_configured) {
+                configured_io_count++;
                 Json::Value item;
                 item["io_index"] = io.io_index;
                 item["trigger_value"] = io.trigger_value; // 返回存储的 int 值 (0 或 1)
                 item["reset_io_index"] = io.reset_io_index;
                 item["description"] = io.description;
 
-                // 检查此已配置 IO 是否在当前已触发状态列表中
+                // Check if this configured IO is present in the list of currently triggered states
                 bool is_currently_triggered = false;
                 for(const auto& triggered_io : triggered_states) {
                     if (triggered_io.io_index == io.io_index) {
@@ -1145,14 +1211,16 @@ void rasterSafetyControl(const Json::Value &root) {
                         break;
                     }
                 }
-                item["is_triggered"] = is_currently_triggered; // 添加当前触发状态
+                item["is_triggered"] = is_currently_triggered; // Add current triggered status
 
                 config_data_array.append(item);
+                if(file_logger) SPDLOG_DEBUG("添加已配置 IO {} 到响应数组.", io.io_index);
             }
         }
+        if(file_logger) SPDLOG_DEBUG("config_data 数组构建完成. 添加了 {} 个已配置 IO.", configured_io_count);
         response["reqRasterSafetyControlCB"]["config_data"] = config_data_array;
         // 除非发生错误，否则 get_config 成功时没有特定的 message.
-        // 如果 getTriggeredIOStates或 getCurrentLimitedSpeed 失败，status 会是 false.
+        // 如果 getTriggeredIOStates 或 getCurrentLimitedSpeed 失败，status 会是 false.
 
     } else {
         std::cerr << "[光栅安全控制] 未知的操作类型: " + operation << std::endl;
@@ -1161,6 +1229,6 @@ void rasterSafetyControl(const Json::Value &root) {
         response["reqRasterSafetyControlCB"]["message"] = "未知操作";
     }
 
-    // 使用 JsonCpp 的 FastWriter 发送响应
+    // Send the response back using JsonCpp's writer
     NRC_SendSocketCustomProtocal(0x927b, Json::FastWriter().write(response));
 }

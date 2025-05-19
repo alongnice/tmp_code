@@ -26,6 +26,9 @@
 #include <string>       // 用于 std::string 和 std::to_string
 #include <sstream>      // 备用，某些复杂拼接可能用得上
 #include <chrono>       // 用于 std::chrono::milliseconds
+#include <vector>       // For std::vector (already in header, but good practice)
+#include <ctime>        // For time_t (already in header, but good practice)
+
 
 // 文件配置使用 nlohmann/json
 using json = nlohmann::json;
@@ -42,7 +45,8 @@ namespace {
         SYSTEM_STATE_LIMITED  // 安全触发激活，机器人已暂停
     };
 
-    // 系统状态变量 (原子变量，用于在主逻辑锁之外安全读取)
+    // System State Variable (atomic for thread-safe reads outside the main logic lock)
+    // 状态变量 (原子变量，用于在主逻辑锁之外安全读取)
     std::atomic<SystemState> current_system_state{SYSTEM_STATE_NORMAL};
 
     // 机器人状态 - 受控机器人各自的信息
@@ -122,7 +126,7 @@ static RobotState& getRobotState(int robot_id) {
 
         if(file_logger) SPDLOG_INFO("已初始化机器人 {} 的状态结构体.", robot_id);
     }
-    return robot_states.at(id); // 使用 at() 以在查找/插入后更安全地访问
+    return robot_states.at(robot_id); // 使用 at() 以在查找/插入后更安全地访问
 }
 
 // 辅助函数: 读取布尔量 IO 状态. 假设 NRC_ReadTcpBoolVar 读取操作是线程安全的.
@@ -320,77 +324,70 @@ static bool save_to_file() {
     std::string filename = CONFIG_DIR + "/" + CONFIG_FILE_NAME;
     json j;
 
-    try {
-        if (!createDirectory(CONFIG_DIR)) {
-            // 错误已在 createDirectory 中记录
-            return false;
-        }
-
-        if(file_logger) SPDLOG_INFO("准备保存配置到文件: {}", filename);
-
-        j["last_update"] = std::time(nullptr);
-        j["io_config"] = json::array();
-
-        // 遍历索引列表查找已配置的 IO
-        for (int i = 0; i < io_list_indexed.size(); ++i) {
-            const auto& cfg = io_list_indexed[i];
-            if (cfg.is_configured) {
-                 json io_item;
-                 io_item["io_index"] = cfg.io_index;
-                 io_item["reset_io_index"] = cfg.reset_io_index;
-                 io_item["trigger_value"] = cfg.trigger_value; // 保存存储的 int 值 (0 或 1)
-                 io_item["description"] = cfg.description;
-                 j["io_config"].push_back(io_item);
-                 if(file_logger) SPDLOG_DEBUG("添加到保存JSON的IO: 索引{}, 复位{}, 触发值{}, 描述='{}'", cfg.io_index, cfg.reset_io_index, cfg.trigger_value, cfg.description);
-            }
-        }
-
-        j["limited_speed"] = configured_limited_speed; // 保存配置的值
-
-        std::ofstream file(filename.c_str());
-        if (!file) {
-            std::cerr << "[光栅安全控制] 无法打开配置文件进行写入: " + filename << std::endl;
-            if(file_logger) SPDLOG_ERROR("无法打开配置文件进行写入: {}", filename);
-            return false;
-        }
-
-        // 写入文件内容，这部分可能抛出异常
-        try {
-            file << j.dump(4); // 漂亮打印，缩进 4 个空格
-            if(file_logger) SPDLOG_DEBUG("JSON内容已写入文件.");
-        } catch (const std::exception& e) {
-            std::cerr << "[光栅安全控制] 写入配置文件内容时发生异常: " + std::string(e.what()) << std::endl;
-            if(file_logger) SPDLOG_ERROR("写入配置文件内容时发生异常: {}", e.what());
-            file.close(); // 确保文件关闭
-            return false;
-        }
-
-        file.close();
-
-        // 检查文件关闭是否成功 (虽然 file.close() 通常不抛异常，但检查可以发现其他问题)
-        if (file.fail()) {
-             std::cerr << "[光栅安全控制] 写入配置文件后关闭文件失败: " + filename << std::endl;
-             if(file_logger) SPDLOG_ERROR("写入配置文件后关闭文件失败: {}", filename);
-             return false;
-        }
-
-
-        if (!setFilePermissions(filename)) {
-            // 错误已在 setFilePermissions 中记录
-            // 文件已保存，但权限设置失败，仍视为保存不完全成功
-            if(file_logger) SPDLOG_WARN("配置文件已写入，但权限设置失败: {}", filename);
-            return false;
-        }
-
-        if(file_logger) SPDLOG_INFO("配置文件保存成功: {}", filename);
-        return true;
-
-    } catch (const std::exception& e) {
-        // 捕获其他任何未预期到的异常
-        std::cerr << "[光栅安全控制] 保存配置文件过程中发生未知异常: " + std::string(e.what()) << std::endl;
-        if(file_logger) SPDLOG_ERROR("保存配置文件过程中发生未知异常: {}", e.what());
+    // 确保目录存在
+    if (!createDirectory(CONFIG_DIR)) {
+        // 错误已在 createDirectory 中记录
         return false;
     }
+
+    if(file_logger) SPDLOG_INFO("准备保存配置到文件: {}", filename);
+
+    j["last_update"] = std::time(nullptr);
+    j["io_config"] = json::array();
+
+    // 遍历索引列表查找已配置的 IO
+    for (int i = 0; i < io_list_indexed.size(); ++i) {
+        const auto& cfg = io_list_indexed[i];
+        if (cfg.is_configured) {
+             json io_item;
+             io_item["io_index"] = cfg.io_index;
+             io_item["reset_io_index"] = cfg.reset_io_index;
+             io_item["trigger_value"] = cfg.trigger_value; // 保存存储的 int 值 (0 或 1)
+             io_item["description"] = cfg.description;
+             j["io_config"].push_back(io_item);
+             if(file_logger) SPDLOG_DEBUG("添加到保存JSON的IO: 索引{}, 复位{}, 触发值{}, 描述='{}'", cfg.io_index, cfg.reset_io_index, cfg.trigger_value, cfg.description);
+        }
+    }
+
+    j["limited_speed"] = configured_limited_speed; // 保存配置的值
+
+    std::ofstream file(filename.c_str());
+    if (!file) {
+        std::cerr << "[光栅安全控制] 无法打开配置文件进行写入: " + filename << std::endl;
+        if(file_logger) SPDLOG_ERROR("无法打开配置文件进行写入: {}", filename);
+        return false;
+    }
+
+    // 写入文件内容，这部分使用 try-catch 捕获 JSON 库可能抛出的异常
+    try {
+        file << j.dump(4); // 漂亮打印，缩进 4 个空格
+        if(file_logger) SPDLOG_DEBUG("JSON内容已写入文件.");
+    } catch (const std::exception& e) {
+        std::cerr << "[光栅安全控制] 写入配置文件内容时发生 JSON 异常: " + std::string(e.what()) << std::endl;
+        if(file_logger) SPDLOG_ERROR("写入配置文件内容时发生 JSON 异常: {}", e.what());
+        file.close(); // 确保文件关闭
+        return false;
+    }
+
+    file.close();
+
+    // 检查文件关闭是否成功 (虽然 file.close() 通常不抛异常，但检查可以发现其他问题)
+    if (file.fail()) {
+         std::cerr << "[光栅安全控制] 写入配置文件后关闭文件失败: " + filename << std::endl;
+         if(file_logger) SPDLOG_ERROR("写入配置文件后关闭文件失败: {}", filename);
+         return false;
+    }
+
+
+    if (!setFilePermissions(filename)) {
+        // 错误已在 setFilePermissions 中记录
+        // 文件已保存，但权限设置失败，仍视为保存不完全成功
+        if(file_logger) SPDLOG_WARN("配置文件已写入，但权限设置失败: {}", filename);
+        return false;
+    }
+
+    if(file_logger) SPDLOG_INFO("配置文件保存成功: {}", filename);
+    return true;
 }
 
 // 从文件加载配置到 io_list_indexed 和 configured_limited_speed
@@ -431,7 +428,7 @@ static bool load_from_file() {
         return false;
     }
 
-    // 解析文件内容，这部分可能抛出异常
+    // 解析文件内容，这部分使用 try-catch 捕获 JSON 库可能抛出的异常
     try {
         file >> j; // 使用 nlohmann/json 从流解析
         if(file_logger) SPDLOG_DEBUG("配置文件内容已成功解析为 JSON.");
@@ -442,7 +439,7 @@ static bool load_from_file() {
         return false;
     }
 
-    file.close();
+    file.close(); // 解析成功后关闭文件
 
     // 将 io_list_indexed 重置为默认状态 (所有未配置)
     io_list_indexed.assign(2049, IOConfig()); // 使用默认构造函数: io_index=-1, is_configured=false
@@ -504,18 +501,18 @@ static bool load_from_file() {
              if(file_logger) SPDLOG_WARN("从文件加载的 configured_limited_speed {} 无效，应在 0-100 范围内. 使用默认值 {}.", configured_limited_speed, 30);
              configured_limited_speed = 30; // 如果加载的值无效，重置为有效的默认值
         }
-        // 注意: 从配置中加载的 'limited_speed' 值被存储，但实际动作总是暂停 (速度 0)
+        if(file_logger) SPDLOG_DEBUG("configured_limited_speed 已加载: {}%", configured_limited_speed);
 
 
         if(file_logger) SPDLOG_INFO("成功从文件加载配置. 已加载配置 IO {} 条, 配置的限速: {}%", loaded_io_count, configured_limited_speed);
         return true;
 
-    } catch (const std::exception& e) {
-        // 捕获其他任何未预期到的异常
-        std::cerr << "[光栅安全控制] 加载配置文件过程中发生未知异常: " + std::string(e.what()) << std::endl;
-        if(file_logger) SPDLOG_ERROR("加载配置文件过程中发生未知异常: {}", e.what());
-        if (file.is_open()) file.close(); // 确保文件关闭
-        return false;
+    // 不再捕获其他任何未预期到的异常，让它们传播以便调试
+    // } catch (const std::exception& e) {
+    //     std::cerr << "[光栅安全控制] 加载配置文件过程中发生未知异常: " + std::string(e.what()) << std::endl;
+    //     if(file_logger) SPDLOG_ERROR("加载配置文件过程中发生未知异常: {}", e.what());
+    //     if (file.is_open()) file.close(); // 确保文件关闭
+    //     return false;
     }
 }
 
@@ -1154,7 +1151,7 @@ void rasterSafetyControl(const Json::Value &root) {
                      continue; // Skip invalid io_index
                  }
                  if (reset_io_index < 0 || reset_io_index > 2048) {
-                      if(file_logger) SPDLOG_WARN("更新配置: IO {} 的复位 io_index {} 无效，应在 0-2048 范围内. 为此条目将 reset_io_index 设为 0.", io_index, reset_io_index);
+                      if(file_logger) SPDLOG_WARN("更新配置: IO {} 的复位 io_index {} 无效，应在 0-2048 范围内. 为此条目将 reset_io_index设为 0.", io_index, reset_io_index);
                       reset_io_index = 0; // Correct invalid reset index
                  }
                  if (trigger_value_int != 0 && trigger_value_int != 1) {

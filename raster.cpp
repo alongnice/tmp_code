@@ -319,7 +319,7 @@ static bool setFilePermissions(const std::string& path) {
 }
 
 // 保存当前配置 (io_list_indexed 和 configured_limited_speed) 到文件
-// 假定调用者已持有 io_mutex.
+// 假定调用者已持有 io_mutex. 不再有最外层 try-catch
 static bool save_to_file() {
     std::string filename = CONFIG_DIR + "/" + CONFIG_FILE_NAME;
     json j;
@@ -390,8 +390,6 @@ static bool save_to_file() {
     return true;
 }
 
-// 从文件加载配置到 io_list_indexed 和 configured_limited_speed
-// 假定调用者已持有 io_mutex.
 static bool load_from_file() {
     std::string filename = CONFIG_DIR + "/" + CONFIG_FILE_NAME;
     std::ifstream file;
@@ -399,19 +397,16 @@ static bool load_from_file() {
 
     // 确保目录存在
     if (!createDirectory(CONFIG_DIR)) {
-        // 错误已在 createDirectory 中记录
         if(file_logger) SPDLOG_ERROR("加载配置失败: 创建目录失败.");
-        return false; // 没有目录无法继续
+        return false;
     }
 
     if (!fileExists(filename)) {
         // 如果找不到配置文件，则创建一个默认文件
         if(file_logger) SPDLOG_INFO("配置文件未找到: {}，将尝试创建默认配置.", filename);
-        // 创建默认配置并保存
-        bool created_default = save_to_file(); // save_to_file 会在此处创建默认内容并保存
+        bool created_default = save_to_file();
         if (created_default) {
             if(file_logger) SPDLOG_INFO("默认配置文件已创建.");
-            // Default config is implicitly loaded by io_list_indexed default constructor and configured_limited_speed init value
             return true; // 默认配置已创建并加载
         } else {
             std::cerr << "[光栅安全控制] 无法创建默认配置文件: " + filename << std::endl;
@@ -428,92 +423,81 @@ static bool load_from_file() {
         return false;
     }
 
-    // 解析文件内容，这部分使用 try-catch 捕获 JSON 库可能抛出的异常
+    // 解析文件内容
     try {
-        file >> j; // 使用 nlohmann/json 从流解析
+        file >> j;
         if(file_logger) SPDLOG_DEBUG("配置文件内容已成功解析为 JSON.");
     } catch(const std::exception& e) {
         std::cerr << "[光栅安全控制] 配置文件解析失败: " + std::string(e.what()) << std::endl;
         if(file_logger) SPDLOG_ERROR("配置文件解析失败: {}", e.what());
-        file.close(); // 确保文件关闭
+        file.close();
         return false;
     }
 
     file.close(); // 解析成功后关闭文件
 
-    // 将 io_list_indexed 重置为默认状态 (所有未配置)
-    io_list_indexed.assign(2049, IOConfig()); // 使用默认构造函数: io_index=-1, is_configured=false
+    // 将 io_list_indexed 重置为默认状态
+    io_list_indexed.assign(2049, IOConfig());
     if(file_logger) SPDLOG_DEBUG("内存中配置已重置为默认状态.");
 
-    if (j.contains("io_config") && j["io_config"].is_array()) {
+    int loaded_io_count = 0; // <-- 将声明移到此处，使其作用域包含后续的 SPDLOG_INFO
+
+    if (j.contains("io_config") && j["io_config"].is_array()) { // <-- if 块开始
         const auto& io_config = j["io_config"];
         if(file_logger) SPDLOG_DEBUG("配置文件包含 'io_config' 数组，开始加载 IO 配置...");
-        int loaded_io_count = 0;
+
         for (const auto& item : io_config) {
             if (item.is_object() && item.contains("io_index") && item["io_index"].is_number_integer()) {
                 int io_index = item["io_index"].get<int>();
 
-                if (io_index >= 0 && io_index <= 2048) { // 验证索引范围
-                    // 使用加载的数据创建 IOConfig 对象
+                if (io_index >= 0 && io_index <= 2048) {
                     IOConfig cfg;
                     cfg.io_index = io_index;
                     cfg.reset_io_index = item.value("reset_io_index", 0);
-                    cfg.trigger_value = item.value("trigger_value", 1); // 默认触发高电平 (1)
+                    cfg.trigger_value = item.value("trigger_value", 1);
                     cfg.description = item.value("description", "");
-                    cfg.already_triggered = false; // 加载时总是未触发
+                    cfg.already_triggered = false;
                     cfg.trigger_time = 0;
-                    cfg.is_configured = true; // 标记为已配置
+                    cfg.is_configured = true;
 
-                    // 验证 reset_io_index 范围
                     if (cfg.reset_io_index < 0 || cfg.reset_io_index > 2048) {
-                         if(file_logger) SPDLOG_WARN("配置文件中IO {} 的复位IO索引 {} 无效，应在 0-2048 范围内. 将复位IO索引设为 0.", cfg.io_index, cfg.reset_io_index);
-                         cfg.reset_io_index = 0; // 修正无效的复位索引
+                         if(file_logger) SPDLOG_WARN("配置文件中IO {} 的复位IO索引 {} 无效. 将复位IO索引设为 0.", cfg.io_index, cfg.reset_io_index);
+                         cfg.reset_io_index = 0;
                     }
-                     // 验证 trigger_value 范围 (虽然上面value()有默认值，但再次检查)
                     if (cfg.trigger_value != 0 && cfg.trigger_value != 1) {
-                        if(file_logger) SPDLOG_WARN("配置文件中IO {} 的触发值 {} 无效，应为 0 或 1. 将设为默认值 1.", cfg.io_index, cfg.trigger_value);
-                        cfg.trigger_value = 1; // 修正无效触发值
+                        if(file_logger) SPDLOG_WARN("配置文件中IO {} 的触发值 {} 无效. 将设为默认值 1.", cfg.io_index, cfg.trigger_value);
+                        cfg.trigger_value = 1;
                     }
 
-
-                    io_list_indexed[io_index] = cfg; // 存储到索引列表
+                    io_list_indexed[io_index] = cfg;
                     loaded_io_count++;
                     if(file_logger) {
-                         std::string debug_msg = "加载 IO 配置: 索引" + std::to_string(cfg.io_index) +
-                                                 ", 复位=" + std::to_string(cfg.reset_io_index) +
-                                                 ", 触发值=" + std::to_string(cfg.trigger_value) +
-                                                 ", 描述='" + cfg.description + "'";
+                         std::string debug_msg = "加载 IO 配置: 索引" + std::to_string(cfg.io_index) + ", 复位=" + std::to_string(cfg.reset_io_index) + ", 触发值=" + std::to_string(cfg.trigger_value) + ", 描述='" + cfg.description + "'";
                          SPDLOG_DEBUG(debug_msg);
                     }
                 } else {
                     if(file_logger) SPDLOG_WARN("配置文件中无效的 IO 索引 {}，应在 0-2048 范围内. 跳过此条目.", io_index);
                 }
-            }
-             if(file_logger) SPDLOG_DEBUG("IO 配置数组加载完成. 加载了 {} 个有效 IO 配置条目.", loaded_io_count);
-        } else {
-             if(file_logger) SPDLOG_WARN("配置文件不包含有效的 'io_config' 数组或数组为空.");
+            } // <-- 这里不需要 else
         }
-
-        // 加载 configured_limited_speed
-        configured_limited_speed = j.value("limited_speed", configured_limited_speed);
-        // 验证 configured_limited_speed 范围
-        if (configured_limited_speed < 0 || configured_limited_speed > 100) {
-             if(file_logger) SPDLOG_WARN("从文件加载的 configured_limited_speed {} 无效，应在 0-100 范围内. 使用默认值 {}.", configured_limited_speed, 30);
-             configured_limited_speed = 30; // 如果加载的值无效，重置为有效的默认值
-        }
-        if(file_logger) SPDLOG_DEBUG("configured_limited_speed 已加载: {}%", configured_limited_speed);
-
-
-        if(file_logger) SPDLOG_INFO("成功从文件加载配置. 已加载配置 IO {} 条, 配置的限速: {}%", loaded_io_count, configured_limited_speed);
-        return true;
-
-    // 不再捕获其他任何未预期到的异常，让它们传播以便调试
-    // } catch (const std::exception& e) {
-    //     std::cerr << "[光栅安全控制] 加载配置文件过程中发生未知异常: " + std::string(e.what()) << std::endl;
-    //     if(file_logger) SPDLOG_ERROR("加载配置文件过程中发生未知异常: {}", e.what());
-    //     if (file.is_open()) file.close(); // 确保文件关闭
-    //     return false;
+        if(file_logger) SPDLOG_DEBUG("IO 配置数组加载完成. 加载了 {} 个有效 IO 配置条目.", loaded_io_count);
+    } // <-- 在这里添加 if (j.contains("io_config")...) 的闭合花括号 '}'
+    else { // <-- 这个 else 现在与上面的 if 配对
+         if(file_logger) SPDLOG_WARN("配置文件不包含有效的 'io_config' 数组或数组为空.");
     }
+
+
+    // 加载 configured_limited_speed
+    configured_limited_speed = j.value("limited_speed", configured_limited_speed);
+    if (configured_limited_speed < 0 || configured_limited_speed > 100) {
+         if(file_logger) SPDLOG_WARN("从文件加载的 configured_limited_speed {} 无效. 使用默认值 {}.", configured_limited_speed, 30);
+         configured_limited_speed = 30;
+    }
+    if(file_logger) SPDLOG_DEBUG("configured_limited_speed 已加载: {}%", configured_limited_speed);
+
+    // loaded_io_count 现在在此处是可见的
+    if(file_logger) SPDLOG_INFO("成功从文件加载配置. 已加载配置 IO {} 条, 配置的限速: {}%", loaded_io_count, configured_limited_speed);
+    return true;
 }
 
 // 主状态机循环
@@ -1044,7 +1028,7 @@ void stopRasterSafetyService() {
         // 如果监测线程可能持有互斥锁，尝试在 join *之前* 获取锁可能会有帮助
         // 尽管设置 thread_running=false 最终会使其退出循环，即使它处于 sleep 状态.
         // 在复杂场景中，更好的方法是使用条件变量或中断机制.
-        // 对于这个简单的 sleep 循环，直接 join 应该可行.
+        // 对于这个简单的 sleep 循环，direct join 应该可行.
 
         monitor_thread->join(); // 阻塞直到线程函数返回
         if (file_logger) {
